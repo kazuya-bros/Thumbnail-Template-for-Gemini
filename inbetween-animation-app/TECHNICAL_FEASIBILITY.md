@@ -122,7 +122,7 @@ Step 4: フレーム列をアニメーション化
 
 - [GitHub](https://github.com/lllyasviel/FramePack) / Apache-2.0
 - **6GB VRAMで動作** — 24GBなら余裕すぎる
-- 内部はHunyuanベース（~13B）、フレーム順次生成
+- 内部はHunyuanVideoベース（~13B）、フレーム順次生成
 - RTX 4090: 2.5秒/フレーム（未最適化）、1.5秒/フレーム（TeaCache）
 - 5秒動画: ~10分（RTX 4090）
 - 逆順生成（inverted anti-drifting）: 入力画像が高品質なアンカーになる
@@ -138,6 +138,45 @@ Step 4: フレーム列をアニメーション化
 ```
 
 **限界**: 変化が最初の1-2秒に集中し残りが静止画になりがち
+
+##### FramePack LoRA学習エコシステム
+
+公式リポジトリにはLoRA機能はないが、コミュニティで**成熟したエコシステム**が構築されている:
+
+**学習ツール**:
+
+| ツール | 特徴 | FramePack対応 | VRAM | 備考 |
+|--------|------|-------------|------|------|
+| **[musubi-tuner](https://github.com/kohya-ss/musubi-tuner)** (kohya-ss) | **最も成熟** | ◎ ネイティブ | 24GB+ | GUI版あり(TTPlanetPig)。FramePack/HunyuanVideo/Wan2.x/FLUX対応 |
+| [finetrainers](https://github.com/a-r-r-o-w/finetrainers) (HuggingFace) | transformerの差し替えで対応 | ○ ハック的 | 24GB+(fp8) | カメラ制御LoRAが30-60分で学習可能 |
+| [diffusion-pipe](https://github.com/tdrussell/diffusion-pipe) | DeepSpeedベースマルチGPU | △ HunyuanVideo経由 | 48GB+推奨 | Linux/WSL2のみ |
+| [HunyuanVideo-Training](https://github.com/spacepxl/HunyuanVideo-Training) | シンプル・単体 | △ HunyuanVideo | 24GB+ | RTX 3090で~30秒/step |
+
+**推論ツール（LoRA読み込み）**:
+
+| ツール | 特徴 |
+|--------|------|
+| **[FramePack-LoRAReady](https://github.com/kohya-ss/FramePack-LoRAReady)** (kohya-ss) | 公式FramePack改変版。LoRA読み込み+fp8量子化対応。musubi-tuner学習LoRAをそのまま利用可 |
+| **[FramePack Studio](https://github.com/FP-Studio/framepack-studio)** | 複数LoRA同時読み込み対応。重み調整UI付き |
+| ComfyUI FramePack Wrapper | `FramePackLoraSelect` ノードでLoRA選択（dev branch） |
+
+**学習データ要件**:
+- **動画データのみ**（画像単体での学習は非対応）
+- 最小: **1動画（48フレーム）** でもカメラ制御LoRAが作成可能（ただし汎用性は低い）
+- 推奨: **10-100本の動画** + キャプション(.txt)
+- 実例: 13本のダンス動画 → RTX 4090で~24時間
+- フレーム抽出は "full" 設定、解像度は640x640デフォルト
+
+**既存のアニメ系LoRA**:
+- [Studio Ghibli Style](https://civitai.com/models/1084814) (HunyuanVideo用、FramePackでは効果不安定)
+- ダンス/揺れ/カメラ制御などモーション系LoRAが主流
+- **アニメキャラ瞬き・口パク特化LoRAはまだ存在しない** → 自作の余地あり
+
+**重要な注意点**:
+- HunyuanVideo用LoRA → FramePackでは**効果が不安定**（FramePackネイティブLoRAを推奨）
+- musubi-tunerでFramePackネイティブ学習したLoRAが最も確実
+- LoRA推論時のVRAM: ベース19.4GB + LoRA → **~23.8GB**（24GBカードでギリギリ）
+- 複数LoRA同時使用はVRAM・品質の両面で厳しい
 
 #### Wan 2.2（★最高品質ローカル）
 
@@ -375,25 +414,44 @@ FramePack (6GB) なら Track A のセグメンテーション + RIFE と併用�
 
 **品質比較**: 同じ入力画像で全手法の結果を並べて比較
 
-### Phase 2: エンジン統合
+### Phase 2: LoRA学習環境構築 + カスタムLoRA作成
+
+**目的**: アニメキャラの瞬き・口パクに特化したFramePack LoRAを自作
+
+1. musubi-tuner（kohya-ss）環境セットアップ
+2. 学習データ準備:
+   - アニメキャラの瞬き・口パク動画を10-30本収集
+   - キャプション作成（「anime character blinks eyes slowly」等）
+   - 解像度統一（640x640）、フレーム抽出設定
+3. FramePackネイティブLoRA学習（musubi-tuner）
+   - 24GB GPUで `--blocks_to_swap`, `--fp8_llm` 等のメモリ最適化
+   - 瞬き特化LoRA / 口パク特化LoRA を個別に学習
+4. FramePack-LoRAReady で推論テスト
+5. 品質評価・ハイパーパラメータ調整（dim, alpha, LR等）
+
+**想定期間**: LoRA学習1本あたり ~24時間（RTX 4090）、24GB GPUなら更に長い
+
+### Phase 3: エンジン統合
 
 1. Track A / B の最良手法を選定
 2. 共通の後処理パイプライン構築
 3. GPUリソース管理（モデルのロード/アンロード切り替え）
 4. ハイブリッドモード（Track A の精密制御 + Track B の自然なモーション）
+5. カスタムLoRA統合（FramePack + 瞬き/口パクLoRA）
 
-### Phase 3: デスクトップアプリ化
+### Phase 4: デスクトップアプリ化
 
 1. Tauri 2.0 + React/Svelte でUI構築
 2. Track A: 比率スライダーUI（目・口独立）
 3. Track B: プロンプト入力 + 動画プレビューUI
 4. 統合タイムラインエディタ
 5. Python Sidecar連携 + GPUリソース管理
+6. LoRA選択UI（カスタムLoRAの切替・重み調整）
 
-### Phase 4: 完成度向上
+### Phase 5: 完成度向上
 
 1. アニメーション書き出し（GIF/APNG/MP4）
 2. プリセットパターン（口パク・瞬きの自然なタイミング）
 3. マスク手動調整UI
 4. バッチ処理（複数表情パターン一括生成）
-5. LoRA微調整（特定キャラスタイルへの最適化）
+5. LoRA共有機能（ユーザーが学習したLoRAの読み込み・エクスポート）
